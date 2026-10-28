@@ -1,0 +1,254 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: PayeeChange Guardian - trusted-channel verification of payment-instruction changes
+
+Parameters:
+  SesFromAddress:       {Type: String, Description: "Verified SES identity used to send approver email"}
+  ApproverEmail:        {Type: String, Description: "Internal AP approver (human fallback)"}
+  WhatsAppOriginationId: {Type: String, Default: "", Description: "End User Messaging Social phone number id (phone-number-id-...)"}
+  WhatsAppTemplate:     {Type: String, Default: "", Description: "Approved template name with 2 quick-reply buttons (leave empty to use interactive buttons inside the 24h window)"}
+  SmsOriginationIdentity: {Type: String, Default: "", Description: "Phone number / sender id / pool id for End User Messaging SMS"}
+  InboundRecipient:     {Type: String, Default: "", Description: "Address that receives supplier emails, e.g. vendor-updates@mail.yourdomain. Leave empty to skip SES inbound (no domain needed); use the dashboard scenarios instead."}
+  BedrockModelId:       {Type: String, Default: "", Description: "Leave empty to run without Bedrock (replies fall back to deterministic rules; anything unclear escalates). Example: us.amazon.nova-micro-v1:0"}
+  VerifyTimeoutSeconds: {Type: Number, Default: 900}
+  EnabledChannels:      {Type: String, Default: "email", Description: "Comma list. Use just 'email' if WhatsApp/SMS are not available on your account yet."}
+  AiProvider:           {Type: String, Default: "", AllowedValues: ["", gemini, groq, bedrock], Description: "Language model for the advisory AI note and free-text replies. Empty = off (or Bedrock if BedrockModelId is set)."}
+  AiModel:              {Type: String, Default: "", Description: "Optional model name; provider default is used when empty."}
+  AiApiKeyParam:        {Type: String, Default: "/payee-guardian/ai-api-key", Description: "SSM SecureString holding the Gemini/Groq key. Must live under /payee-guardian/."}
+  PublicBaseUrl:        {Type: String, Default: "", Description: "DashboardUrl from the first deploy, without trailing slash. Needed for the email confirmation links; redeploy once with it set."}
+
+Conditions:
+  HasInbound: !Not [!Equals [!Ref InboundRecipient, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 30
+    MemorySize: 256
+    CodeUri: src/
+    Environment:
+      Variables:
+        VENDORS_TABLE: !Ref VendorsTable
+        CASES_TABLE: !Ref CasesTable
+        SES_FROM_ADDRESS: !Ref SesFromAddress
+        WHATSAPP_ORIGINATION_ID: !Ref WhatsAppOriginationId
+        WHATSAPP_TEMPLATE: !Ref WhatsAppTemplate
+        SMS_ORIGINATION_IDENTITY: !Ref SmsOriginationIdentity
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        VERIFY_TIMEOUT_SECONDS: !Ref VerifyTimeoutSeconds
+        EVENT_BUS: !Ref EventBus
+        ENABLED_CHANNELS: !Ref EnabledChannels
+        PUBLIC_BASE_URL: !Ref PublicBaseUrl
+        AI_PROVIDER: !Ref AiProvider
+        AI_MODEL: !Ref AiModel
+        AI_API_KEY_PARAM: !Ref AiApiKeyParam
+        STATE_MACHINE_ARN: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-verify"
+
+Resources:
+  VendorsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: vendor_id, AttributeType: S}]
+      KeySchema: [{AttributeName: vendor_id, KeyType: HASH}]
+
+  CasesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: case_id, AttributeType: S}]
+      KeySchema: [{AttributeName: case_id, KeyType: HASH}]
+      TimeToLiveSpecification: {AttributeName: expires_at, Enabled: true}
+
+  EventBus:
+    Type: AWS::Events::EventBus
+    Properties: {Name: !Sub "${AWS::StackName}-bus"}
+
+  InboundBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-inbound-${AWS::AccountId}"
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      LifecycleConfiguration: {Rules: [{Status: Enabled, ExpirationInDays: 14}]}
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - {Event: "s3:ObjectCreated:*", Function: !GetAtt IngestFunction.Arn}
+    DependsOn: IngestInvokePermission
+
+  InboundBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InboundBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ses.amazonaws.com}
+            Action: s3:PutObject
+            Resource: !Sub "${InboundBucket.Arn}/*"
+            Condition: {StringEquals: {"AWS:SourceAccount": !Ref "AWS::AccountId"}}
+
+  IngestInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IngestFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref "AWS::AccountId"
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: guardian.handlers.ingest.handler
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref VendorsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref CasesTable}
+        - Statement:
+            - {Effect: Allow, Action: s3:GetObject, Resource: !Sub "arn:${AWS::Partition}:s3:::${AWS::StackName}-inbound-${AWS::AccountId}/*"}
+            - {Effect: Allow, Action: states:StartExecution, Resource: !GetAtt VerifyMachine.Arn}
+            - {Effect: Allow, Action: ses:SendEmail, Resource: "*"}
+            - {Effect: Allow, Action: ssm:GetParameter, Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/payee-guardian/*"}
+
+  StepFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: guardian.handlers.step.handler
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref VendorsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref CasesTable}
+        - Statement:
+            - {Effect: Allow, Action: [ses:SendEmail], Resource: "*"}
+            - {Effect: Allow, Action: [sms-voice:SendTextMessage], Resource: "*"}
+            - {Effect: Allow, Action: [social-messaging:SendWhatsAppMessage], Resource: "*"}
+            - {Effect: Allow, Action: [states:SendTaskSuccess], Resource: "*"}
+            - {Effect: Allow, Action: [events:PutEvents], Resource: !GetAtt EventBus.Arn}
+
+  ReplyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: guardian.handlers.reply.handler
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref VendorsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref CasesTable}
+        - Statement:
+            - {Effect: Allow, Action: [states:SendTaskSuccess], Resource: "*"}
+            - {Effect: Allow, Action: [bedrock:InvokeModel, bedrock:Converse], Resource: "*"}
+            - {Effect: Allow, Action: [ses:SendEmail], Resource: "*"}
+            - {Effect: Allow, Action: ssm:GetParameter, Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/payee-guardian/*"}
+      Events:
+        WhatsApp: {Type: SNS, Properties: {Topic: !Ref WhatsAppInboundTopic}}
+        Sms: {Type: SNS, Properties: {Topic: !Ref SmsInboundTopic}}
+
+  AiNoteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: guardian.handlers.ai_note.handler
+      Timeout: 100
+      Environment:
+        Variables:
+          AI_DEADLINE_SECONDS: "80"
+          AI_CALL_TIMEOUT: "25"
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref VendorsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref CasesTable}
+        - Statement:
+            - {Effect: Allow, Action: ssm:GetParameter, Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/payee-guardian/*"}
+            - {Effect: Allow, Action: [bedrock:InvokeModel, bedrock:Converse], Resource: "*"}
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: guardian.handlers.api.handler
+      Environment:
+        Variables:
+          AI_FUNCTION_NAME: !Ref AiNoteFunction
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref VendorsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref CasesTable}
+        - Statement:
+            - {Effect: Allow, Action: states:StartExecution, Resource: !GetAtt VerifyMachine.Arn}
+            - {Effect: Allow, Action: states:SendTaskSuccess, Resource: "*"}
+            - {Effect: Allow, Action: ses:SendEmail, Resource: "*"}
+            - {Effect: Allow, Action: lambda:InvokeFunction, Resource: !GetAtt AiNoteFunction.Arn}
+            - {Effect: Allow, Action: ssm:GetParameter, Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/payee-guardian/*"}
+      Events:
+        Any: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Path: "/{proxy+}", Method: ANY}}
+        Root: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Path: /, Method: GET}}
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings: {ThrottlingBurstLimit: 10, ThrottlingRateLimit: 5}
+
+  WhatsAppInboundTopic: {Type: AWS::SNS::Topic}
+  SmsInboundTopic: {Type: AWS::SNS::Topic}
+
+  VerifyMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${AWS::StackName}-verify"
+      DefinitionUri: statemachine/guardian.asl.json
+      DefinitionSubstitutions:
+        StepFunctionArn: !GetAtt StepFunction.Arn
+      Policies:
+        - LambdaInvokePolicy: {FunctionName: !Ref StepFunction}
+
+  # EventBridge: terminal-state events and failed executions raise an operator alert
+  OpsTopic: {Type: AWS::SNS::Topic}
+
+  BlockedCaseRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref EventBus
+      EventPattern: {source: [guardian.cases], detail-type: [CaseBlocked, CaseEscalated]}
+      Targets: [{Id: ops, Arn: !Ref OpsTopic}]
+
+  OpsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref OpsTopic]
+      PolicyDocument:
+        Statement:
+          - {Effect: Allow, Principal: {Service: events.amazonaws.com}, Action: sns:Publish, Resource: !Ref OpsTopic}
+
+  StuckExecutionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source: [aws.states]
+        detail-type: [Step Functions Execution Status Change]
+        detail: {status: [FAILED, TIMED_OUT, ABORTED], stateMachineArn: [!GetAtt VerifyMachine.Arn]}
+      Targets: [{Id: ops, Arn: !Ref OpsTopic}]
+
+  # SES inbound: store the raw message in S3, which triggers ingest
+  ReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Condition: HasInbound
+
+  ReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    Condition: HasInbound
+    DependsOn: InboundBucketPolicy
+    Properties:
+      RuleSetName: !Ref ReceiptRuleSet
+      Rule:
+        Enabled: true
+        ScanEnabled: true
+        Recipients: [!Ref InboundRecipient]
+        Actions:
+          - S3Action: {BucketName: !Ref InboundBucket}
+
+  BudgetAlarm:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget: {BudgetType: COST, TimeUnit: MONTHLY, BudgetLimit: {Amount: 40, Unit: USD}}
+      NotificationsWithSubscribers:
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref ApproverEmail}]
+
+Outputs:
+  DashboardUrl: {Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/"}
+  WhatsAppInboundTopicArn: {Value: !Ref WhatsAppInboundTopic, Description: "Set as the event destination of the WhatsApp Business Account"}
+  SmsInboundTopicArn: {Value: !Ref SmsInboundTopic, Description: "Set as the two-way SMS destination of the origination number"}
+  VendorsTable: {Value: !Ref VendorsTable}
+  InboundBucket: {Value: !Ref InboundBucket}

@@ -1,0 +1,9 @@
+.env
+*.pem
+*.key
+.aws-sam/
+__pycache__/
+.pytest_cache/
+*.pyc
+packaged.yaml
+samconfig.toml

@@ -1,0 +1,217 @@
+{
+  "Comment": "PayeeChange Guardian: hold the change, verify through the REGISTERED contact, fall back across channels, escalate to a human. Each wait uses a task token that the reply Lambda completes.",
+  "StartAt": "SendWhatsApp",
+  "States": {
+    "SendWhatsApp": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "TimeoutSecondsPath": "$.timeout_seconds",
+      "Parameters": {
+        "FunctionName": "${StepFunctionArn}",
+        "Payload": {
+          "action": "send",
+          "case_id.$": "$.case_id",
+          "channel": "whatsapp",
+          "token.$": "$$.Task.Token"
+        }
+      },
+      "ResultPath": "$.wa",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout"
+          ],
+          "ResultPath": "$.wa",
+          "Next": "WhatsAppTimedOut"
+        }
+      ],
+      "Next": "WhatsAppDecision"
+    },
+    "WhatsAppTimedOut": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${StepFunctionArn}",
+        "Payload": {
+          "action": "timeout",
+          "case_id.$": "$.case_id",
+          "channel": "whatsapp"
+        }
+      },
+      "ResultPath": "$.wa",
+      "Next": "SendSms",
+      "ResultSelector": {
+        "decision.$": "$.Payload.decision"
+      }
+    },
+    "WhatsAppDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.wa.decision",
+          "StringEquals": "SEND_FAILED",
+          "Next": "SendSms"
+        }
+      ],
+      "Default": "FinalizeWa"
+    },
+    "SendSms": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "TimeoutSecondsPath": "$.timeout_seconds",
+      "Parameters": {
+        "FunctionName": "${StepFunctionArn}",
+        "Payload": {
+          "action": "send",
+          "case_id.$": "$.case_id",
+          "channel": "sms",
+          "token.$": "$$.Task.Token"
+        }
+      },
+      "ResultPath": "$.sms",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout"
+          ],
+          "ResultPath": "$.sms",
+          "Next": "SmsTimedOut"
+        }
+      ],
+      "Next": "SmsDecision"
+    },
+    "SmsTimedOut": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${StepFunctionArn}",
+        "Payload": {
+          "action": "timeout",
+          "case_id.$": "$.case_id",
+          "channel": "sms"
+        }
+      },
+      "ResultPath": "$.sms",
+      "Next": "SendEmail",
+      "ResultSelector": {
+        "decision.$": "$.Payload.decision"
+      }
+    },
+    "SmsDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.sms.decision",
+          "StringEquals": "SEND_FAILED",
+          "Next": "SendEmail"
+        }
+      ],
+      "Default": "FinalizeSms"
+    },
+    "EscalateToHuman": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${StepFunctionArn}",
+        "Payload": {
+          "action": "finalize",
+          "case_id.$": "$.case_id",
+          "decision": "ESCALATE"
+        }
+      },
+      "End": true
+    },
+    "FinalizeWa": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${StepFunctionArn}",
+        "Payload": {
+          "action": "finalize",
+          "case_id.$": "$.case_id",
+          "decision.$": "$.wa.decision"
+        }
+      },
+      "End": true
+    },
+    "FinalizeSms": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${StepFunctionArn}",
+        "Payload": {
+          "action": "finalize",
+          "case_id.$": "$.case_id",
+          "decision.$": "$.sms.decision"
+        }
+      },
+      "End": true
+    },
+    "SendEmail": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "TimeoutSecondsPath": "$.timeout_seconds",
+      "Parameters": {
+        "FunctionName": "${StepFunctionArn}",
+        "Payload": {
+          "action": "send",
+          "case_id.$": "$.case_id",
+          "channel": "email",
+          "token.$": "$$.Task.Token"
+        }
+      },
+      "ResultPath": "$.email",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.Timeout"
+          ],
+          "ResultPath": "$.email",
+          "Next": "EmailTimedOut"
+        }
+      ],
+      "Next": "EmailDecision"
+    },
+    "EmailTimedOut": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${StepFunctionArn}",
+        "Payload": {
+          "action": "timeout",
+          "case_id.$": "$.case_id",
+          "channel": "email"
+        }
+      },
+      "ResultSelector": {
+        "decision.$": "$.Payload.decision"
+      },
+      "ResultPath": "$.email",
+      "Next": "EscalateToHuman"
+    },
+    "EmailDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.email.decision",
+          "StringEquals": "SEND_FAILED",
+          "Next": "EscalateToHuman"
+        }
+      ],
+      "Default": "FinalizeEmail"
+    },
+    "FinalizeEmail": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${StepFunctionArn}",
+        "Payload": {
+          "action": "finalize",
+          "case_id.$": "$.case_id",
+          "decision.$": "$.email.decision"
+        }
+      },
+      "End": true
+    }
+  }
+}

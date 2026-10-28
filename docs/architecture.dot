@@ -1,0 +1,32 @@
+digraph G {
+  rankdir=LR; fontname="Helvetica"; nodesep=0.35; ranksep=0.6;
+  node [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled", fillcolor="#f4f6fa", color="#5d6675"];
+  edge [fontname="Helvetica", fontsize=9, color="#5d6675"];
+
+  supplier [label="Supplier email\n(UNTRUSTED)", fillcolor="#fdeceb", color="#b3261e"];
+
+  subgraph cluster_aws { label="AWS (us-east-1, deployed with AWS SAM)"; fontsize=12; style="rounded,dashed"; color="#8a93a3";
+    api   [label="API Gateway + Lambda\nintake, risk score, policy\n+ dashboard"];
+    reg   [label="DynamoDB\nTRUSTED vendor registry", shape=cylinder, fillcolor="#e6f5ed", color="#0b7a62"];
+    cases [label="DynamoDB\ncases + audit trail", shape=cylinder];
+    sfn   [label="Step Functions\nwaitForTaskToken\nchange HELD until verified", fillcolor="#e8f0fd", color="#2447c9"];
+    step  [label="Step Lambda\nchooses channel from the\nREGISTRY, never the email"];
+    ses   [label="Amazon SES v2\nsesv2.SendEmail\nLIVE", fillcolor="#ffe9c7", color="#b36b00"];
+    page  [label="One-time confirm page\nGET preview / POST decide\n(scanner-safe)"];
+    wa    [label="End User Messaging Social\nWhatsApp buttons\nimplemented, not enabled", fillcolor="#f0f0f0", style="rounded,filled,dashed"];
+    sms   [label="End User Messaging SMS\nfallback\nimplemented, not enabled", fillcolor="#f0f0f0", style="rounded,filled,dashed"];
+    worker[label="AI note Lambda\n(async, off the decision path)", fillcolor="#efe6fb", color="#6a3fb5"];
+    ssm   [label="SSM Parameter Store\nSecureString API key", fillcolor="#efe6fb", color="#6a3fb5"];
+    eb    [label="EventBridge + SNS\nblocked / escalated /\nstuck execution alerts"];
+  }
+  vendor [label="Registered supplier contact\n(on file, not from the email)", fillcolor="#e6f5ed", color="#0b7a62"];
+  llm    [label="LLM (external, swappable)\nGemini today, Amazon Bedrock\nvia one setting\nADVISORY ONLY: note + reply label", fillcolor="#efe6fb", color="#6a3fb5"];
+
+  supplier -> api [label="bank-change request"];
+  api -> reg [label="who is this vendor?"];
+  api -> cases; api -> sfn [label="start"];
+  sfn -> step; step -> ses [label="registry contact"]; step -> wa [style=dashed]; step -> sms [style=dashed];
+  ses -> vendor [label="verification email"]; vendor -> page [label="Yes / No"]; page -> sfn [label="SendTaskSuccess"];
+  sfn -> cases; sfn -> eb;
+  api -> worker [style=dashed, label="async"]; worker -> ssm [style=dashed]; worker -> llm [style=dashed, label="HTTPS"]; worker -> cases [style=dashed, label="note"];
+}
